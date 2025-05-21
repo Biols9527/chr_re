@@ -19,6 +19,239 @@ suppressPackageStartupMessages({
 # Bayesian Reconstruction Core Functions
 #===============================================================================
 
+#' Initialize Bayesian Run (Internal Helper)
+#'
+#' Performs initial setup, input validation, default settings, and tree pruning.
+#'
+#' @param tree Phylogenetic tree object
+#' @param chr_counts Chromosome counts, named vector with species names
+#' @param model Evolutionary model string
+#' @param mcmc_settings List of MCMC settings or NULL
+#' @param priors List of prior distributions or NULL
+#' @param allow_jumps Logical, whether to allow jumps (for JumpBM model)
+#' @return A list containing: `pruned_tree`, `ordered_counts`, 
+#'         `effective_mcmc_settings`, `effective_priors`.
+#' @keywords internal
+initialize_bayesian_run_internal <- function(tree, chr_counts, model, 
+                                           mcmc_settings, priors, allow_jumps) {
+  # Check input
+  if (!inherits(tree, "phylo")) {
+    stop("tree must be a phylo object")
+  }
+  if (is.null(names(chr_counts))) {
+    stop("chr_counts must be a named vector with species names")
+  }
+  supported_models <- c("BM", "OU", "JumpBM", "RateShift")
+  if (!model %in% supported_models) {
+    stop(paste("Unsupported model. Choose from:", paste(supported_models, collapse = ", ")))
+  }
+  if (!requireNamespace("rjags", quietly = TRUE)) {
+    stop("Package 'rjags' and JAGS software are required for Bayesian analysis")
+  }
+
+  message(sprintf("Initializing Bayesian %s model run...", model))
+
+  # Set default MCMC settings if not provided
+  effective_mcmc_settings <- mcmc_settings
+  if (is.null(effective_mcmc_settings)) {
+    effective_mcmc_settings <- list(
+      iterations = 50000,    # Total MCMC iterations
+      burnin = 10000,        # Burn-in iterations to discard
+      thinning = 20,         # Thinning interval
+      chains = 4             # Number of MCMC chains
+    )
+  }
+  
+  # Set default priors if not provided
+  effective_priors <- priors
+  if (is.null(effective_priors)) {
+    effective_priors <- get_default_priors(model)
+  }
+  
+  # Ensure tree and data contain same species
+  common_species <- intersect(names(chr_counts), tree$tip.label)
+  if (length(common_species) < 3) {
+    stop("Fewer than 3 species in common, cannot perform Bayesian reconstruction")
+  }
+  
+  # Prune tree to match data
+  pruned_tree <- ape::keep.tip(tree, common_species)
+  
+  # Order data to match tree
+  ordered_counts <- chr_counts[pruned_tree$tip.label]
+  
+  return(list(
+    pruned_tree = pruned_tree,
+    ordered_counts = ordered_counts,
+    effective_mcmc_settings = effective_mcmc_settings,
+    effective_priors = effective_priors
+  ))
+}
+
+#' Prepare JAGS Input (Internal Helper)
+#'
+#' Prepares the JAGS model string, data list, and parameters to monitor.
+#'
+#' @param pruned_tree Pruned phylogenetic tree object
+#' @param ordered_counts Ordered chromosome counts for tips
+#' @param model Evolutionary model string
+#' @param effective_priors List of effective prior distributions
+#' @param allow_jumps Logical, whether to allow jumps
+#' @return A list containing: `jags_model_text`, `jags_data_list`, `monitor_parameters`.
+#' @keywords internal
+prepare_jags_input_internal <- function(pruned_tree, ordered_counts, model, 
+                                      effective_priors, allow_jumps) {
+  
+  # Create tree structure data for JAGS model
+  tree_data <- prepare_tree_data(pruned_tree) # Existing helper
+  
+  # Prepare JAGS model string
+  jags_model_text <- build_bayesian_model(model, tree_data, effective_priors, allow_jumps) # Existing helper
+  
+  # Prepare data for JAGS
+  jags_data_list <- list(
+    N_tips = length(ordered_counts),
+    N_nodes = pruned_tree$Nnode,
+    N_edges = nrow(pruned_tree$edge),
+    y = ordered_counts,
+    parent = tree_data$parent,
+    child = tree_data$child,
+    edge_length = tree_data$edge_length,
+    is_tip = tree_data$is_tip 
+  )
+  
+  # Add model-specific data to jags_data_list
+  if (model == "OU") {
+    jags_data_list$node_height <- tree_data$node_height
+  } else if (model == "RateShift") {
+    jags_data_list$edge_group <- rep(1, nrow(pruned_tree$edge)) # Default: all edges in one group
+    jags_data_list$N_groups <- 1
+  }
+  
+  # Parameters to monitor
+  monitor_parameters <- c("states", "sigma2")
+  if (model == "OU") {
+    monitor_parameters <- c(monitor_parameters, "alpha", "theta")
+  } else if (model == "JumpBM") {
+    monitor_parameters <- c(monitor_parameters, "jump_prob", "jump_size")
+  } else if (model == "RateShift") {
+    monitor_parameters <- c(monitor_parameters, "rate_multiplier")
+  }
+  
+  return(list(
+    jags_model_text = jags_model_text,
+    jags_data_list = jags_data_list,
+    monitor_parameters = monitor_parameters
+  ))
+}
+
+#' Run MCMC Sampling (Internal Helper)
+#'
+#' Executes the MCMC sampling using JAGS, supporting parallel or sequential chains.
+#'
+#' @param jags_model_text Text string of the JAGS model.
+#' @param jags_data_list List of data for JAGS.
+#' @param monitor_parameters Vector of parameters to monitor.
+#' @param effective_mcmc_settings List of effective MCMC settings.
+#' @param use_parallel Logical, whether to run chains in parallel.
+#' @param model_name_for_messages Name of the model, for messages.
+#' @return The `mcmc.list` object containing the samples.
+#' @keywords internal
+run_mcmc_sampling_internal <- function(jags_model_text, jags_data_list, monitor_parameters,
+                                     effective_mcmc_settings, use_parallel, model_name_for_messages) {
+  
+  message("Starting MCMC sampling...")
+  
+  if (use_parallel && effective_mcmc_settings$chains > 1 && requireNamespace("parallel", quietly = TRUE)) {
+    n_cores <- min(parallel::detectCores() - 1, effective_mcmc_settings$chains)
+    if (n_cores < 1) n_cores <- 1
+    
+    message(sprintf("Running %d MCMC chains for %s model on %d cores...", 
+                    effective_mcmc_settings$chains, model_name_for_messages, n_cores))
+    
+    cl <- parallel::makeCluster(n_cores)
+    # Export all necessary variables and specifically use the environment of this function
+    # for jags_model_text, jags_data_list etc. to ensure they are found.
+    parallel::clusterExport(cl, c("jags_model_text", "jags_data_list", "monitor_parameters", "effective_mcmc_settings"),
+                            envir = environment())
+    parallel::clusterEvalQ(cl, {
+      library(rjags)
+    })
+    
+    chain_results <- parallel::parLapply(cl, 1:effective_mcmc_settings$chains, function(chain_num) {
+      # Each chain needs its own model compilation and adaptation
+      jags_instance <- rjags::jags.model(textConnection(jags_model_text), data = jags_data_list,
+                                         n.chains = 1, n.adapt = 5000, quiet = TRUE)
+      # Burn-in for this specific chain
+      update(jags_instance, n.iter = effective_mcmc_settings$burnin, progress.bar = "none")
+      # Sample from posterior for this specific chain
+      samples <- rjags::coda.samples(jags_instance, variable.names = monitor_parameters,
+                                     n.iter = effective_mcmc_settings$iterations,
+                                     thin = effective_mcmc_settings$thinning,
+                                     progress.bar = "none")
+      return(samples[[1]]) # Return the mcmc object from the list
+    })
+    parallel::stopCluster(cl)
+    mcmc_samples <- coda::as.mcmc.list(chain_results)
+    
+  } else {
+    message(sprintf("Running %d MCMC chains for %s model sequentially...", 
+                    effective_mcmc_settings$chains, model_name_for_messages))
+    
+    jags_instance <- rjags::jags.model(textConnection(jags_model_text), data = jags_data_list,
+                                       n.chains = effective_mcmc_settings$chains, n.adapt = 5000, quiet = FALSE)
+    update(jags_instance, n.iter = effective_mcmc_settings$burnin) # Progress bar will show by default
+    mcmc_samples <- rjags::coda.samples(jags_instance, variable.names = monitor_parameters,
+                                        n.iter = effective_mcmc_settings$iterations,
+                                        thin = effective_mcmc_settings$thinning) # Progress bar
+  }
+  
+  message("MCMC sampling completed.")
+  return(mcmc_samples)
+}
+
+#' Compile Bayesian Results (Internal Helper)
+#'
+#' Processes MCMC samples and assembles the final results object.
+#'
+#' @param mcmc_samples The `mcmc.list` object from `run_mcmc_sampling_internal`.
+#' @param pruned_tree Pruned phylogenetic tree object.
+#' @param ordered_counts Ordered chromosome counts for tips.
+#' @param model Evolutionary model string.
+#' @param effective_mcmc_settings List of effective MCMC settings.
+#' @param effective_priors List of effective prior distributions.
+#' @param original_chr_counts Original chromosome counts (before pruning/ordering).
+#' @return The final result list for `reconstruct_chromosomes_bayesian`.
+#' @keywords internal
+compile_bayesian_results_internal <- function(mcmc_samples, pruned_tree, ordered_counts, model,
+                                            effective_mcmc_settings, effective_priors, original_chr_counts) {
+  
+  # Process MCMC samples using the existing helper
+  processed_results <- process_mcmc_samples(mcmc_samples, pruned_tree, ordered_counts, model) # Existing helper
+  
+  # Assemble the final result list
+  final_result <- list(
+    ancestral_states = processed_results$ancestral_states,
+    tree = pruned_tree,
+    method = "Bayesian",
+    model = model,
+    mcmc_samples = mcmc_samples,
+    model_parameters = processed_results$model_parameters,
+    convergence = processed_results$convergence,
+    tip_states = ordered_counts,
+    mcmc_settings = effective_mcmc_settings,
+    priors = effective_priors,
+    original_data = list(
+      chr_counts = original_chr_counts # Use the original, full chr_counts here
+    )
+  )
+  
+  # Calculate reconstruction quality metrics using the existing helper
+  final_result$quality <- calculate_bayesian_quality(final_result) # Existing helper
+  
+  return(final_result)
+}
+
 #' Reconstruct ancestral chromosome numbers using Bayesian MCMC
 #' 
 #' Applies Bayesian inference via MCMC to reconstruct ancestral chromosome numbers
@@ -40,185 +273,51 @@ reconstruct_chromosomes_bayesian <- function(tree, chr_counts,
                                            priors = NULL,
                                            allow_jumps = TRUE,
                                            use_parallel = TRUE) {
-  # Check input
-  if(!inherits(tree, "phylo")) {
-    stop("tree must be a phylo object")
-  }
-  
-  # Ensure chr_counts is a named vector
-  if(is.null(names(chr_counts))) {
-    stop("chr_counts must be a named vector with species names")
-  }
-  
-  # Check if model is supported
-  supported_models <- c("BM", "OU", "JumpBM", "RateShift")
-  if(!model %in% supported_models) {
-    stop(paste("Unsupported model. Choose from:", paste(supported_models, collapse = ", ")))
-  }
-  
-  # Check JAGS installation
-  if(!requireNamespace("rjags", quietly = TRUE)) {
-    stop("Package 'rjags' and JAGS software are required for Bayesian analysis")
-  }
-  
-  message(sprintf("Using Bayesian %s model to reconstruct ancestral chromosome numbers...", model))
-  
-  # Set default MCMC settings if not provided
-  if(is.null(mcmc_settings)) {
-    mcmc_settings <- list(
-      iterations = 50000,    # Total MCMC iterations
-      burnin = 10000,        # Burn-in iterations to discard
-      thinning = 20,         # Thinning interval
-      chains = 4             # Number of MCMC chains
-    )
-  }
-  
-  # Set default priors if not provided
-  if(is.null(priors)) {
-    priors <- get_default_priors(model)
-  }
-  
-  # Ensure tree and data contain same species
-  common_species <- intersect(names(chr_counts), tree$tip.label)
-  if(length(common_species) < 3) {
-    stop("Fewer than 3 species in common, cannot perform Bayesian reconstruction")
-  }
-  
-  # Prune tree to match data
-  pruned_tree <- ape::keep.tip(tree, common_species)
-  
-  # Order data to match tree
-  ordered_counts <- chr_counts[pruned_tree$tip.label]
-  
-  # Create tree structure data for JAGS model
-  tree_data <- prepare_tree_data(pruned_tree)
-  
-  # Prepare JAGS model
-  jags_model <- build_bayesian_model(model, tree_data, priors, allow_jumps)
-  
-  # Prepare data for JAGS
-  jags_data <- list(
-    N_tips = length(ordered_counts),
-    N_nodes = pruned_tree$Nnode,
-    N_edges = nrow(pruned_tree$edge),
-    y = ordered_counts,
-    parent = tree_data$parent,
-    child = tree_data$child,
-    edge_length = tree_data$edge_length,
-    is_tip = tree_data$is_tip
+
+  # Step 1: Initialization (validation, defaults, tree pruning)
+  # The message "Using Bayesian %s model..." is part of initialize_bayesian_run_internal
+  init_results <- initialize_bayesian_run_internal(
+    tree = tree, 
+    chr_counts = chr_counts, 
+    model = model, 
+    mcmc_settings = mcmc_settings, 
+    priors = priors, 
+    allow_jumps = allow_jumps
   )
   
-  # Add model-specific data
-  if(model == "OU") {
-    # Distance from root for OU model
-    jags_data$node_height <- tree_data$node_height
-  } else if(model == "RateShift") {
-    # Edge groups for rate shift model (default: all edges in one group)
-    jags_data$edge_group <- rep(1, nrow(pruned_tree$edge))
-    jags_data$N_groups <- 1
-  }
-  
-  # Parameters to monitor
-  monitor_params <- c("states", "sigma2")
-  
-  # Add model-specific parameters
-  if(model == "OU") {
-    monitor_params <- c(monitor_params, "alpha", "theta")
-  } else if(model == "JumpBM") {
-    monitor_params <- c(monitor_params, "jump_prob", "jump_size")
-  } else if(model == "RateShift") {
-    monitor_params <- c(monitor_params, "rate_multiplier")
-  }
-  
-  message("Starting MCMC sampling...")
-  
-  # Run MCMC sampling
-  if(use_parallel && mcmc_settings$chains > 1 && requireNamespace("parallel", quietly = TRUE)) {
-    # Run chains in parallel
-    n_cores <- min(parallel::detectCores() - 1, mcmc_settings$chains)
-    if(n_cores < 1) n_cores <- 1
-    
-    message(sprintf("Running %d MCMC chains on %d cores...", mcmc_settings$chains, n_cores))
-    
-    # Create cluster
-    cl <- parallel::makeCluster(n_cores)
-    
-    # Export necessary variables and functions
-    parallel::clusterExport(cl, c("jags_model", "jags_data", "monitor_params", "mcmc_settings"), 
-                         envir = environment())
-    
-    # Load required packages on each node
-    parallel::clusterEvalQ(cl, {
-      library(rjags)
-    })
-    
-    # Run chains in parallel
-    chain_results <- parallel::parLapply(cl, 1:mcmc_settings$chains, function(chain) {
-      # Initialize model
-      jags_instance <- rjags::jags.model(textConnection(jags_model), data = jags_data, 
-                                      n.chains = 1, n.adapt = 5000, quiet = TRUE)
-      
-      # Burn-in
-      update(jags_instance, n.iter = mcmc_settings$burnin, progress.bar = "none")
-      
-      # Sample from posterior
-      samples <- rjags::coda.samples(jags_instance, variable.names = monitor_params, 
-                                  n.iter = mcmc_settings$iterations, 
-                                  thin = mcmc_settings$thinning,
-                                  progress.bar = "none")
-      
-      return(samples[[1]])
-    })
-    
-    # Stop cluster
-    parallel::stopCluster(cl)
-    
-    # Combine chains
-    mcmc_samples <- coda::as.mcmc.list(chain_results)
-    
-  } else {
-    # Run chains sequentially
-    message(sprintf("Running %d MCMC chains sequentially...", mcmc_settings$chains))
-    
-    # Initialize model
-    jags_instance <- rjags::jags.model(textConnection(jags_model), data = jags_data, 
-                                    n.chains = mcmc_settings$chains, n.adapt = 5000)
-    
-    # Burn-in
-    update(jags_instance, n.iter = mcmc_settings$burnin)
-    
-    # Sample from posterior
-    mcmc_samples <- rjags::coda.samples(jags_instance, variable.names = monitor_params, 
-                                     n.iter = mcmc_settings$iterations, 
-                                     thin = mcmc_settings$thinning)
-  }
-  
-  message("MCMC sampling completed")
-  
-  # Process MCMC samples
-  results <- process_mcmc_samples(mcmc_samples, pruned_tree, ordered_counts, model)
-  
-  # Add complete result information
-  result <- list(
-    ancestral_states = results$ancestral_states,
-    tree = pruned_tree,
-    method = "Bayesian",
+  # Step 2: Prepare JAGS model string, data, and parameters to monitor
+  jags_input <- prepare_jags_input_internal(
+    pruned_tree = init_results$pruned_tree,
+    ordered_counts = init_results$ordered_counts,
     model = model,
-    mcmc_samples = mcmc_samples,
-    model_parameters = results$model_parameters,
-    convergence = results$convergence,
-    tip_states = ordered_counts,
-    mcmc_settings = mcmc_settings,
-    priors = priors,
-    original_data = list(
-      chr_counts = chr_counts
-    )
+    effective_priors = init_results$effective_priors,
+    allow_jumps = allow_jumps
   )
   
-  # Calculate reconstruction quality metrics
-  result$quality <- calculate_bayesian_quality(result)
+  # Step 3: Run MCMC Sampling
+  # Messages related to MCMC start and chain execution are in run_mcmc_sampling_internal
+  mcmc_samples <- run_mcmc_sampling_internal(
+    jags_model_text = jags_input$jags_model_text,
+    jags_data_list = jags_input$jags_data_list,
+    monitor_parameters = jags_input$monitor_parameters,
+    effective_mcmc_settings = init_results$effective_mcmc_settings,
+    use_parallel = use_parallel,
+    model_name_for_messages = model # Pass model name for more descriptive messages
+  )
+  # The message "MCMC sampling completed" is part of run_mcmc_sampling_internal
   
-  return(result)
+  # Step 4: Process MCMC samples and compile final results
+  final_bayesian_result <- compile_bayesian_results_internal(
+    mcmc_samples = mcmc_samples,
+    pruned_tree = init_results$pruned_tree,
+    ordered_counts = init_results$ordered_counts,
+    model = model,
+    effective_mcmc_settings = init_results$effective_mcmc_settings,
+    effective_priors = init_results$effective_priors,
+    original_chr_counts = chr_counts # Pass original chr_counts for the final result object
+  )
+  
+  return(final_bayesian_result)
 }
 
 #' Prepare tree structure data for JAGS model

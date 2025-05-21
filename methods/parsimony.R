@@ -9,7 +9,7 @@
 suppressPackageStartupMessages({
   library(ape)       # For phylogenetic tree operations
   library(phangorn)  # For parsimony methods
-  library(Rcpp)      # For C++ integration
+  library(Rcpp)      # For C++ integration # Rcpp is imported. Review if this is a direct dependency or an indirect one via phangorn that benefits from explicit loading. If not strictly needed, consider removing.
 })
 
 #===============================================================================
@@ -71,6 +71,8 @@ reconstruct_chromosomes_parsimony <- function(tree, chr_counts,
     discrete = discrete
   )
   
+  # This function acts as a dispatcher to the specific parsimony algorithm implementations
+  # based on the 'method' argument.
   # Apply appropriate parsimony method
   if(method == "fitch") {
     reconstruction <- apply_fitch_parsimony(reconstruction, discrete)
@@ -181,7 +183,8 @@ apply_fitch_parsimony <- function(reconstruction, discrete = TRUE) {
     reconstruction$parsimony_score <- attr(parsimony_result, "pscore")
     
   } else {
-    # For continuous data, implement Wagner parsimony (for Fitch with continuous data)
+    # For non-discrete data, Fitch parsimony is not directly applicable; 
+    # this function defers to the Wagner parsimony implementation which handles continuous characters.
     return(apply_wagner_parsimony(reconstruction))
   }
   
@@ -194,6 +197,10 @@ apply_fitch_parsimony <- function(reconstruction, discrete = TRUE) {
 #' @return Updated reconstruction data
 #' @keywords internal
 apply_wagner_parsimony <- function(reconstruction) {
+  # Note: This implementation uses ape::ace(..., type = "continuous", method = "ML", model = "BM") 
+  # as an approximation for Wagner parsimony ancestral state reconstruction. 
+  # A traditional Wagner algorithm involves a two-pass tree traversal (bottom-up then top-down) 
+  # to determine ancestral state intervals and then specific states.
   message("Applying Wagner parsimony algorithm for continuous characters...")
   
   # Extract tree and tip states
@@ -287,8 +294,9 @@ apply_sankoff_parsimony <- function(reconstruction, cost_matrix = NULL) {
     message("Discretizing continuous chromosome counts for Sankoff parsimony...")
     
     # Determine appropriate bins for discretization
+    # If input data is not discrete, it's binned into a maximum of ~20 bins for Sankoff analysis.
     counts_range <- range(tip_states)
-    bin_width <- max(1, (counts_range[2] - counts_range[1]) / 20)  # Max of 20 bins
+    bin_width <- max(1, (counts_range[2] - counts_range[1]) / 20)  # Max of ~20 bins
     
     # Create bins
     bins <- seq(floor(counts_range[1]), ceiling(counts_range[2]) + bin_width, by = bin_width)
@@ -431,6 +439,11 @@ apply_sankoff_parsimony <- function(reconstruction, cost_matrix = NULL) {
 #' @return Updated reconstruction data
 #' @keywords internal
 apply_weighted_parsimony <- function(reconstruction, weight_function = NULL) {
+  # Note: This is a simplified implementation of weighted parsimony. 
+  # It starts with a Wagner-like parsimony reconstruction and then calculates 
+  # a weighted parsimony score based on the provided weight_function. 
+  # A full Sankoff-based weighted parsimony would typically involve dynamic programming 
+  # with the custom weights throughout the tree traversal.
   message("Applying weighted parsimony algorithm...")
   
   # Extract tree and tip states
@@ -1270,144 +1283,6 @@ test_parsimony_simulation <- function(tree, root_count = 12,
                  best_method, mae_means[best_method_idx]))
   
   return(sim_results)
-}
-
-#' Simulate chromosome evolution
-#' 
-#' Simulate chromosome count evolution on a tree
-#' 
-#' @param tree Phylogenetic tree
-#' @param root_count Root chromosome count
-#' @param model Evolutionary model
-#' @param params Simulation parameters
-#' @return Simulated chromosome data
-#' @keywords internal
-simulate_chromosome_evolution <- function(tree, root_count, model, params) {
-  # Initialize result
-  sim_data <- list(
-    tree = tree,
-    model = model,
-    params = params,
-    root_state = root_count
-  )
-  
-  # Prepare node containers
-  n_nodes <- tree$Nnode + Ntip(tree)
-  node_states <- numeric(n_nodes)
-  node_states[Ntip(tree) + 1] <- root_count  # Root state
-  
-  # Apply simulation model
-  if(model == "BM") {
-    # Brownian motion simulation
-    sigma <- params$sigma
-    
-    # Simulate along each edge of the tree
-    for(i in 1:nrow(tree$edge)) {
-      parent <- tree$edge[i, 1]
-      child <- tree$edge[i, 2]
-      branch_length <- tree$edge.length[i]
-      
-      # Get parent state
-      parent_state <- node_states[parent]
-      
-      # Simulate state change using Brownian motion
-      change <- rnorm(1, mean = 0, sd = sigma * sqrt(branch_length))
-      child_state <- parent_state + change
-      
-      # Ensure non-negative value with floor at 1
-      node_states[child] <- max(1, child_state)
-    }
-  } else if(model == "jumps") {
-    # Jump model with occasional large changes
-    sigma <- params$sigma
-    jump_prob <- params$jump_prob
-    jump_size <- params$jump_size
-    
-    # Simulate along each edge of the tree
-    for(i in 1:nrow(tree$edge)) {
-      parent <- tree$edge[i, 1]
-      child <- tree$edge[i, 2]
-      branch_length <- tree$edge.length[i]
-      
-      # Get parent state
-      parent_state <- node_states[parent]
-      
-      # Decide if a jump occurs
-      if(runif(1) < jump_prob) {
-        # Simulate jump: fusion (down) or fission/duplication (up)
-        if(runif(1) < 0.5) {
-          # Fusion (decrease)
-          change <- -rexp(1, rate = 1/jump_size)
-        } else {
-          # Fission/duplication (increase)
-          change <- rexp(1, rate = 1/jump_size)
-        }
-      } else {
-        # Regular BM change
-        change <- rnorm(1, mean = 0, sd = sigma * sqrt(branch_length))
-      }
-      
-      child_state <- parent_state + change
-      
-      # Ensure non-negative value with floor at 1
-      node_states[child] <- max(1, child_state)
-    }
-  } else if(model == "hybrid") {
-    # Hybrid model: BM with occasional jumps and trend
-    sigma <- params$sigma
-    jump_prob <- params$jump_prob
-    jump_size <- params$jump_size
-    trend <- if(is.null(params$trend)) 0 else params$trend
-    
-    # Simulate along each edge of the tree
-    for(i in 1:nrow(tree$edge)) {
-      parent <- tree$edge[i, 1]
-      child <- tree$edge[i, 2]
-      branch_length <- tree$edge.length[i]
-      
-      # Get parent state
-      parent_state <- node_states[parent]
-      
-      # Base change with trend component
-      base_change <- rnorm(1, mean = trend * branch_length, sd = sigma * sqrt(branch_length))
-      
-      # Decide if a jump occurs
-      if(runif(1) < jump_prob) {
-        # Simulate jump: fusion (down) or fission/duplication (up)
-        if(runif(1) < 0.5) {
-          # Fusion (decrease)
-          jump_change <- -rexp(1, rate = 1/jump_size)
-        } else {
-          # Fission/duplication (increase)
-          jump_change <- rexp(1, rate = 1/jump_size)
-        }
-        
-        # Combine changes
-        change <- base_change + jump_change
-      } else {
-        change <- base_change
-      }
-      
-      child_state <- parent_state + change
-      
-      # Ensure non-negative value with floor at 1
-      node_states[child] <- max(1, child_state)
-    }
-  } else {
-    stop("Unsupported simulation model:", model)
-  }
-  
-  # Extract tip and internal node states
-  tip_states <- node_states[1:Ntip(tree)]
-  names(tip_states) <- tree$tip.label
-  internal_states <- node_states[(Ntip(tree)+1):n_nodes]
-  
-  # Store simulation results
-  sim_data$tip_states <- tip_states
-  sim_data$ancestral_states <- internal_states
-  sim_data$all_states <- node_states
-  
-  return(sim_data)
 }
 
 #===============================================================================

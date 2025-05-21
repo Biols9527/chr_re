@@ -18,6 +18,147 @@ suppressPackageStartupMessages({
 # Maximum Likelihood Reconstruction Functions
 #===============================================================================
 
+#' Initialize ML Run (Internal Helper)
+#'
+#' Performs initial input validation, tree pruning, and data ordering.
+#'
+#' @param tree Phylogenetic tree object.
+#' @param chr_counts Chromosome counts, named vector.
+#' @param model Evolutionary model string.
+#' @return A list: `list(pruned_tree = pruned_tree, ordered_counts = ordered_counts)`.
+#' @keywords internal
+initialize_ml_run_internal <- function(tree, chr_counts, model) {
+  # Check input
+  if (!inherits(tree, "phylo")) {
+    stop("tree must be a phylo object")
+  }
+  if (is.null(names(chr_counts))) {
+    stop("chr_counts must be a named vector with species names")
+  }
+  supported_models <- c("BM", "OU", "EB", "ACDC", "lambda")
+  if (!model %in% supported_models) {
+    stop(paste("Unsupported model. Choose from:", paste(supported_models, collapse = ", ")))
+  }
+
+  message(sprintf("Initializing ML reconstruction with %s model...", model)) # Message moved here
+
+  # Ensure tree and data contain same species
+  common_species <- intersect(names(chr_counts), tree$tip.label)
+  if (length(common_species) < 3) {
+    stop("Fewer than 3 species in common, cannot perform ancestral state reconstruction")
+  }
+  
+  # Prune tree to match data
+  pruned_tree <- ape::keep.tip(tree, common_species)
+  
+  # Order data to match tree
+  ordered_counts <- chr_counts[pruned_tree$tip.label]
+  
+  return(list(pruned_tree = pruned_tree, ordered_counts = ordered_counts))
+}
+
+#' Estimate Ancestral States using ML (Internal Helper)
+#'
+#' Performs ancestral state estimation based on the chosen model and fitted parameters.
+#'
+#' @param pruned_tree Pruned phylogenetic tree object.
+#' @param ordered_counts Ordered chromosome counts for tips.
+#' @param model Evolutionary model string.
+#' @param model_fit The result from `fit_evolutionary_model`.
+#' @return The `ace_result` object from `ape::ace` or `reconstruct_ou_model`.
+#' @keywords internal
+estimate_ancestral_states_ml_internal <- function(pruned_tree, ordered_counts, model, model_fit) {
+  ace_result <- NULL
+  
+  # For different models, use appropriate method
+  if (model == "BM") {
+    message("Estimating ancestral states using Brownian Motion model (ape::ace)...")
+    ace_result <- ape::ace(ordered_counts, pruned_tree, type = "continuous", method = "ML")
+  } else if (model == "OU") {
+    message("Estimating ancestral states using Ornstein-Uhlenbeck model (custom reconstruction)...")
+    # reconstruct_ou_model is an existing helper in this file
+    ace_result <- reconstruct_ou_model(pruned_tree, ordered_counts, model_fit$parameters$alpha)
+  } else if (model %in% c("EB", "ACDC", "lambda")) {
+    message(sprintf("Estimating ancestral states using %s model with tree transformation...", model))
+    # Use transformations of the tree according to models
+    rate_param <- if (model == "EB") model_fit$parameters$r else
+                  if (model == "ACDC") model_fit$parameters$beta else
+                  model_fit$parameters$lambda
+                  
+    # Call the moved transform_tree_by_model function
+    # Assuming 'transform_tree_by_model' from core/simulation_tools.R is loaded into the environment.
+    # If it were in a package or specific environment, it would be e.g., simulation_tools::transform_tree_by_model
+    if (!exists("transform_tree_by_model", mode = "function")) {
+        stop("transform_tree_by_model function not found. Ensure core/simulation_tools.R is sourced/loaded.")
+    }
+    transformed_tree <- transform_tree_by_model(pruned_tree, model, rate_param)
+    
+    # Use standard ACE on transformed tree
+    ace_result <- ape::ace(ordered_counts, transformed_tree, type = "continuous", method = "ML")
+  } else {
+    # This case should ideally be caught by initial validation, but as a safeguard:
+    stop(sprintf("Ancestral state estimation for model '%s' is not implemented here.", model))
+  }
+  
+  return(ace_result)
+}
+
+#' Format ML Reconstruction Results (Internal Helper)
+#'
+#' Formats the results from `ace` into the standard output structure.
+#'
+#' @param ace_result The result from `estimate_ancestral_states_ml_internal`.
+#' @param pruned_tree Pruned phylogenetic tree object.
+#' @param ordered_counts Ordered chromosome counts for tips.
+#' @param model Evolutionary model string.
+#' @param model_fit The result from `fit_evolutionary_model`.
+#' @param original_chr_counts Original chromosome counts (before pruning/ordering).
+#' @param confidence_level Confidence level for CI calculation (currently noted but not used for dynamic CI).
+#' @return The final formatted result list.
+#' @keywords internal
+format_ml_results_internal <- function(ace_result, pruned_tree, ordered_counts, model, 
+                                     model_fit, original_chr_counts, confidence_level) {
+  
+  # Extract ancestral states
+  node_ids <- (Ntip(pruned_tree) + 1):(Ntip(pruned_tree) + Nnode(pruned_tree))
+  
+  # Create ancestral states data frame
+  # Note: confidence_level parameter is available. Currently, 1.96 (95% CI) is hardcoded.
+  # To use confidence_level dynamically: z_score <- qnorm(1 - (1 - confidence_level) / 2)
+  # Then use z_score instead of 1.96.
+  ancestors <- data.frame(
+    node_id = node_ids,
+    state = ace_result$ace,
+    ci_lower = ace_result$ace - 1.96 * sqrt(diag(ace_result$var.anc)), # 1.96 for 95% CI
+    ci_upper = ace_result$ace + 1.96 * sqrt(diag(ace_result$var.anc)), # 1.96 for 95% CI
+    stringsAsFactors = FALSE
+  )
+  
+  # Ensure non-negative lower bound
+  ancestors$ci_lower <- pmax(0, ancestors$ci_lower)
+  
+  message(paste("Completed ancestral chromosome reconstruction formatting for", nrow(ancestors), "nodes."))
+  
+  # Compile final result
+  final_result_structure <- list(
+    ancestral_states = ancestors,
+    tree = pruned_tree,
+    method = "ML",
+    model = model,
+    model_fit = model_fit,
+    tip_states = ordered_counts,
+    ace_object = ace_result, # Storing the raw ACE result can be useful
+    original_data = list(
+      chr_counts = original_chr_counts # Store the original, full chr_counts
+    )
+  )
+  
+  # Calculate reconstruction quality metrics using the existing helper
+  final_result_structure$quality <- calculate_ml_quality(final_result_structure) # Existing helper
+  
+  return(final_result_structure)
+}
+
 #' Reconstruct ancestral chromosome numbers using maximum likelihood
 #' 
 #' Applies maximum likelihood inference to reconstruct ancestral chromosome numbers
@@ -36,100 +177,45 @@ reconstruct_chromosomes_ml <- function(tree, chr_counts,
                                     estimation_method = "reml",
                                     bounded = TRUE,
                                     confidence_level = 0.95) {
-  # Check input
-  if(!inherits(tree, "phylo")) {
-    stop("tree must be a phylo object")
-  }
   
-  # Ensure chr_counts is a named vector
-  if(is.null(names(chr_counts))) {
-    stop("chr_counts must be a named vector with species names")
-  }
+  # Step 1: Initialization (validation, pruning, ordering)
+  # The message "Initializing ML reconstruction with %s model..." is in initialize_ml_run_internal
+  init_data <- initialize_ml_run_internal(tree, chr_counts, model)
+  # init_data contains $pruned_tree and $ordered_counts
   
-  # Check if model is supported
-  supported_models <- c("BM", "OU", "EB", "ACDC", "lambda")
-  if(!model %in% supported_models) {
-    stop(paste("Unsupported model. Choose from:", paste(supported_models, collapse = ", ")))
-  }
+  # Step 2: Fit evolutionary model (existing helper)
+  # The message "Fitting %s model to chromosome count data..." is in fit_evolutionary_model
+  model_fit <- fit_evolutionary_model(
+    tree = init_data$pruned_tree, 
+    chr_counts = init_data$ordered_counts, 
+    model = model, 
+    method = estimation_method, 
+    bounded = bounded
+  )
+  # The message "Model fitting completed..." is in fit_evolutionary_model
   
-  message(sprintf("Using %s model with maximum likelihood to reconstruct ancestral chromosome numbers...", model))
-  
-  # Ensure tree and data contain same species
-  common_species <- intersect(names(chr_counts), tree$tip.label)
-  if(length(common_species) < 3) {
-    stop("Fewer than 3 species in common, cannot perform ancestral state reconstruction")
-  }
-  
-  # Prune tree to match data
-  pruned_tree <- ape::keep.tip(tree, common_species)
-  
-  # Order data to match tree
-  ordered_counts <- chr_counts[pruned_tree$tip.label]
-  
-  # Fit evolutionary model and estimate parameters
-  model_fit <- fit_evolutionary_model(pruned_tree, ordered_counts, model, 
-                                   method = estimation_method, bounded = bounded)
-  
-  # Reconstruct ancestral states using fitted model
-  ace_result <- NULL
-  
-  # For different models, use appropriate method
-  if(model == "BM") {
-    # Use standard ACE for Brownian Motion
-    ace_result <- ape::ace(ordered_counts, pruned_tree, type = "continuous", method = "ML")
-    
-  } else if(model == "OU") {
-    # Use ML with fitted alpha parameter for OU model
-    ace_result <- reconstruct_ou_model(pruned_tree, ordered_counts, model_fit$parameters$alpha)
-    
-  } else if(model %in% c("EB", "ACDC", "lambda")) {
-    # Use transformations of the tree according to models
-    rate_param <- if(model == "EB") model_fit$parameters$r else 
-                  if(model == "ACDC") model_fit$parameters$beta else
-                  model_fit$parameters$lambda
-                  
-    # Transform tree according to model parameter
-    transformed_tree <- transform_tree_by_model(pruned_tree, model, rate_param)
-    
-    # Use standard ACE on transformed tree
-    ace_result <- ape::ace(ordered_counts, transformed_tree, type = "continuous", method = "ML")
-  }
-  
-  # Extract ancestral states
-  node_ids <- (Ntip(pruned_tree) + 1):(Ntip(pruned_tree) + Nnode(pruned_tree))
-  
-  # Create ancestral states data frame
-  ancestors <- data.frame(
-    node_id = node_ids,
-    state = ace_result$ace,
-    ci_lower = ace_result$ace - 1.96 * sqrt(diag(ace_result$var.anc)),
-    ci_upper = ace_result$ace + 1.96 * sqrt(diag(ace_result$var.anc)),
-    stringsAsFactors = FALSE
+  # Step 3: Estimate ancestral states using the appropriate ML method
+  # Messages related to specific estimation methods are in estimate_ancestral_states_ml_internal
+  ace_result <- estimate_ancestral_states_ml_internal(
+    pruned_tree = init_data$pruned_tree,
+    ordered_counts = init_data$ordered_counts,
+    model = model,
+    model_fit = model_fit
   )
   
-  # Ensure non-negative lower bound
-  ancestors$ci_lower <- pmax(0, ancestors$ci_lower)
-  
-  message(paste("Completed ancestral chromosome reconstruction for", nrow(ancestors), "nodes"))
-  
-  # Compile final result
-  result <- list(
-    ancestral_states = ancestors,
-    tree = pruned_tree,
-    method = "ML",
+  # Step 4: Format results
+  # The message "Completed ancestral chromosome reconstruction formatting..." is in format_ml_results_internal
+  final_result <- format_ml_results_internal(
+    ace_result = ace_result,
+    pruned_tree = init_data$pruned_tree,
+    ordered_counts = init_data$ordered_counts,
     model = model,
     model_fit = model_fit,
-    tip_states = ordered_counts,
-    ace_object = ace_result,
-    original_data = list(
-      chr_counts = chr_counts
-    )
+    original_chr_counts = chr_counts, # Pass the original chr_counts
+    confidence_level = confidence_level
   )
   
-  # Calculate reconstruction quality metrics
-  result$quality <- calculate_ml_quality(result)
-  
-  return(result)
+  return(final_result)
 }
 
 #' Fit evolutionary model to chromosome count data
@@ -209,97 +295,6 @@ fit_evolutionary_model <- function(tree, chr_counts, model = "BM",
 
 #' Transform phylogenetic tree according to model parameters
 #' 
-#' @param tree Phylogenetic tree
-#' @param model Model type: "EB", "ACDC", "lambda"
-#' @param parameter Model parameter value
-#' @return Transformed tree
-#' @keywords internal
-transform_tree_by_model <- function(tree, model, parameter) {
-  # Create a copy of the tree to modify
-  transformed_tree <- tree
-  
-  # Apply appropriate transformation
-  if(model == "EB") {
-    # Early Burst: exponential rate change over time
-    # Branch lengths are transformed as: b' = b * (exp(r*T) - exp(r*(T-b)))/r
-    # where T is the tree height, b is the branch length, r is the rate parameter
-    
-    tree_height <- max(node.depth.edgelength(tree))
-    node_depths <- node.depth.edgelength(tree)
-    
-    for(i in 1:nrow(tree$edge)) {
-      parent <- tree$edge[i, 1]
-      child <- tree$edge[i, 2]
-      
-      # Calculate depth at start and end of branch
-      if(child <= Ntip(tree)) {
-        end_depth <- node_depths[child]
-      } else {
-        end_depth <- node_depths[child - Ntip(tree) + Ntip(tree)]
-      }
-      
-      if(parent <= Ntip(tree)) {
-        start_depth <- node_depths[parent]
-      } else {
-        start_depth <- node_depths[parent - Ntip(tree) + Ntip(tree)]
-      }
-      
-      branch_length <- tree$edge.length[i]
-      
-      # Apply EB transformation
-      if(abs(parameter) < 1e-6) {
-        # For very small r, use linear approximation
-        transformed_length <- branch_length
-      } else {
-        # Full transformation
-        transformed_length <- (exp(parameter * start_depth) - 
-                             exp(parameter * end_depth)) / parameter
-      }
-      
-      transformed_tree$edge.length[i] <- transformed_length
-    }
-    
-  } else if(model == "ACDC") {
-    # ACDC: accelerating/decelerating rates
-    # Branch lengths are transformed as: b' = b * exp(beta * d)
-    # where d is the node depth, beta is the parameter
-    
-    node_depths <- node.depth.edgelength(tree)
-    
-    for(i in 1:nrow(tree$edge)) {
-      parent <- tree$edge[i, 1]
-      child <- tree$edge[i, 2]
-      
-      # Calculate depth at start of branch
-      if(parent <= Ntip(tree)) {
-        depth <- node_depths[parent]
-      } else {
-        depth <- node_depths[parent - Ntip(tree) + Ntip(tree)]
-      }
-      
-      # Apply ACDC transformation
-      transformed_tree$edge.length[i] <- tree$edge.length[i] * exp(parameter * depth)
-    }
-    
-  } else if(model == "lambda") {
-    # Lambda: scales internal branches
-    # For internal branches: b' = b * lambda
-    # For terminal branches: unchanged
-    
-    for(i in 1:nrow(tree$edge)) {
-      child <- tree$edge[i, 2]
-      
-      # Check if branch leads to a tip
-      if(child > Ntip(tree)) {
-        # Internal branch
-        transformed_tree$edge.length[i] <- tree$edge.length[i] * parameter
-      }
-    }
-  }
-  
-  return(transformed_tree)
-}
-
 #' Reconstruct ancestral states under the OU model
 #' 
 #' @param tree Phylogenetic tree
@@ -595,12 +590,28 @@ simulate_chromosome_evolution <- function(tree, model_fits, n_simulations = 100,
     
     # Run simulations
     simulations <- replicate(n_simulations, {
-      sim_counts <- simulate_model(tree, model, root_state, sigma_sq, extra_params)
+      # Prepare parameters for run_chromosome_simulation
+      simulation_params <- list(
+        sigma_sq = sigma_sq,
+        extra_params = extra_params # Contains alpha, theta, r, beta, lambda as needed
+      )
+      
+      # Call the unified simulation function from core/simulation_tools.R
+      # Assuming run_chromosome_simulation is available in the environment (e.g. sourced)
+      sim_result_obj <- run_chromosome_simulation(
+        tree = tree,
+        simulation_type = "continuous_fitted",
+        model_name = model,
+        root_state = root_state,
+        params = simulation_params
+      )
+      
+      sim_counts_tips <- sim_result_obj$tip_states
       
       # Ensure non-negative counts (impose floor at 1)
-      sim_counts <- pmax(1, round(sim_counts))
+      sim_counts_tips <- pmax(1, round(sim_counts_tips))
       
-      return(sim_counts)
+      return(sim_counts_tips)
     }, simplify = FALSE)
     
     # Store results
@@ -670,62 +681,6 @@ simulate_chromosome_evolution <- function(tree, model_fits, n_simulations = 100,
   }
   
   return(sim_results)
-}
-
-#' Simulate chromosome evolution under a specified model
-#' 
-#' @param tree Phylogenetic tree
-#' @param model Evolutionary model
-#' @param root_state Starting state at root
-#' @param sigma_sq Rate parameter
-#' @param extra_params Additional model parameters
-#' @return Simulated chromosome counts
-#' @keywords internal
-simulate_model <- function(tree, model, root_state, sigma_sq, extra_params = list()) {
-  # Default to Brownian Motion
-  if(model == "BM") {
-    # Use standard BM simulation
-    sim <- sim.char(tree, 1, sigma_sq, model = "BM", root.value = root_state)[,1]
-  } else if(model == "OU") {
-    # Extract OU parameters
-    alpha <- extra_params$alpha
-    theta <- extra_params$theta
-    
-    # OU simulation
-    sim <- sim.char(tree, 1, sigma_sq, model = "OU", root.value = root_state, 
-                  alpha = alpha, theta = theta)[,1]
-  } else if(model == "EB") {
-    # Extract EB parameter
-    r <- extra_params$r
-    
-    # Transform tree according to EB model
-    transformed_tree <- transform_tree_by_model(tree, "EB", r)
-    
-    # Simulate BM on transformed tree
-    sim <- sim.char(transformed_tree, 1, sigma_sq, model = "BM", root.value = root_state)[,1]
-  } else if(model == "ACDC") {
-    # Extract ACDC parameter
-    beta <- extra_params$beta
-    
-    # Transform tree according to ACDC model
-    transformed_tree <- transform_tree_by_model(tree, "ACDC", beta)
-    
-    # Simulate BM on transformed tree
-    sim <- sim.char(transformed_tree, 1, sigma_sq, model = "BM", root.value = root_state)[,1]
-  } else if(model == "lambda") {
-    # Extract lambda parameter
-    lambda <- extra_params$lambda
-    
-    # Transform tree according to lambda model
-    transformed_tree <- transform_tree_by_model(tree, "lambda", lambda)
-    
-    # Simulate BM on transformed tree
-    sim <- sim.char(transformed_tree, 1, sigma_sq, model = "BM", root.value = root_state)[,1]
-  } else {
-    stop(paste("Unsupported model for simulation:", model))
-  }
-  
-  return(sim)
 }
 
 #===============================================================================

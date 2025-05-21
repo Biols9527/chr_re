@@ -32,6 +32,9 @@ suppressPackageStartupMessages({
 #' @export
 load_config <- function(config_file = NULL, override = NULL) {
   # Default configuration
+  # For very large configurations, this object could be moved to a separate 
+  # helper file (e.g., `config_defaults.R`) or defined as a global constant 
+  # if static, to improve the readability of `load_config`.
   default_config <- list(
     # Phylogenetic parameters
     phylo = list(
@@ -225,6 +228,8 @@ DataFlow <- R6::R6Class(
       self$data[[name]] <- value
       
       # Record metadata
+      # TODO: Consider extracting metadata update logic into a private helper method 
+      # (e.g., private$.update_metadata) for future refactoring if desired.
       self$metadata[[name]] <- list(
         added_time = Sys.time(),
         stage = stage,
@@ -267,6 +272,8 @@ DataFlow <- R6::R6Class(
         self$data[[name]] <- value
         
         # Update metadata
+        # TODO: Consider extracting metadata update logic into a private helper method 
+        # (e.g., private$.update_metadata) for future refactoring if desired.
         md <- self$metadata[[name]]
         md$updated_time <- Sys.time()
         if(!is.null(stage)) md$stage <- stage
@@ -338,16 +345,17 @@ DataFlow <- R6::R6Class(
         # Load data and metadata
         self$data <- loaded$data
         self$metadata <- loaded$metadata
-        old_history <- self$history  # Keep current history
-        self$history <- loaded$history
+        # When a data flow is loaded, the history from the file becomes the new current history.
+        self$history <- loaded$history 
         
-        # Add load record to history
-        load_entry <- list(
+        # A new entry for the "load" event itself should be prepended to this newly loaded history.
+        load_event_entry <- list(
           time = Sys.time(),
           action = "load",
           description = sprintf("Loaded data flow from file '%s'", file)
         )
-        self$history <- c(self$history, list(load_entry), old_history)
+        # Prepend the load event to the history
+        self$history <- c(list(load_event_entry), self$history)
         
         # Update last modified time
         self$metadata$last_modified <- Sys.time()
@@ -602,6 +610,8 @@ AnalysisPipeline <- R6::R6Class(
         
         if(self$config$advanced$debug) {
           message("Stack trace:")
+          # The following print(sys.calls()) is for debugging and might be 
+          # made optional or logged to a file in a production system.
           print(sys.calls())
         }
         
@@ -683,37 +693,45 @@ AnalysisPipeline <- R6::R6Class(
       temp_mark <- setNames(rep(FALSE, length(nodes)), nodes)
       ordered <- character(0)
       
+      # The visit function performs a Depth First Search (DFS) traversal.
+      # It marks nodes temporarily (temp_mark) to detect cycles and permanently (visited) 
+      # once all its descendants are processed.
+      # Nodes are added to the 'ordered' list *after* all their dependencies are visited.
       visit <- function(node) {
         if(temp_mark[node]) {
-          stop("Circular dependency detected")
+          stop("Circular dependency detected") # Cycle detected
         }
         
         if(!visited[node]) {
-          temp_mark[node] <- TRUE
+          temp_mark[node] <- TRUE # Mark node as temporarily visited
           
-          # Process dependencies
+          # Process dependencies (descendants in the dependency graph)
           deps <- self$stages[[node]]$dependencies
           if(!is.null(deps)) {
             for(dep in deps) {
-              visit(dep)
+              ordered <- visit(dep) # Recursively visit dependencies
             }
           }
           
-          temp_mark[node] <- FALSE
-          visited[node] <- TRUE
-          ordered <- c(node, ordered)
+          temp_mark[node] <- FALSE # Unmark temporary visit
+          visited[node] <- TRUE   # Mark node as permanently visited
+          # Add the current node to the beginning of the 'ordered' list.
+          # This builds the list in reverse topological order.
+          ordered <- c(node, ordered) 
         }
         
         return(ordered)
       }
       
-      # Apply DFS to each unvisited node
+      # Apply DFS to each unvisited node to handle disconnected graph components.
       for(node in nodes) {
         if(!visited[node]) {
           ordered <- visit(node)
         }
       }
       
+      # The 'ordered' list is built in reverse topological order (dependencies appear after dependents).
+      # Reverse it to get the correct execution order (dependencies first).
       return(rev(ordered))
     },
     
